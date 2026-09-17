@@ -1,0 +1,401 @@
+// bsonvalue — the element types, the document that keeps its order,
+// and the accessors over both.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT BSON IS.  A binary serialisation of a document: a four-byte
+// little-endian total length, then zero or more elements, then a
+// `0x00`.  An element is a one-byte type code, a NUL-terminated key,
+// and a payload whose shape the type code fixes.  An array is stored as
+// a document whose keys are the decimal strings `"0"`, `"1"`, `"2"` and
+// so on, which is why an array costs more bytes than a JSON array and
+// why reading one is reading a document.
+//
+// A DOCUMENT IS AN ORDERED LIST OF ELEMENTS, NOT A MAP.  Two facts of
+// the format force it.  BSON preserves the order the elements were
+// written in, and a driver that reordered them would change the bytes a
+// checksum or a signature was taken over.  And BSON permits a document
+// to carry the same key twice — the server rejects such a document, but
+// a reader has to be able to SEE both elements to say so, and a map
+// would have dropped one.  So `BsonDoc` is a list, `get` answers the
+// FIRST element with a key, and `count_of` is how a validator finds the
+// duplicate.
+//
+// EVERY TYPE READS, THE CURRENT ONES WRITE.  `BsonValue` has an arm for
+// every element type BSON 1.1 assigns, the five deprecated ones
+// included, because a document written years ago is still a document
+// somebody has to read.  The writer refuses the deprecated arms by
+// name.  `is_deprecated` is the question in between.
+
+// One element type.
+//
+// Twenty-one arms, one per type code BSON 1.1 assigns.  `type_code`
+// answers the byte, and the doc comment on each arm names it.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     println(bsonvalue.type_name(BsonInt32(7)))    // int32
+//     println("${bsonvalue.type_code(BsonInt32(7))}")   // 16
+// ```
+pub enum BsonValue
+    // `0x01` — a 64-bit IEEE 754 binary floating-point number, which is
+    // what a novo-lang `Float` is.
+    BsonDouble(v: Float)
+    // `0x02` — a UTF-8 string, length-prefixed and NUL-terminated on
+    // the wire.  The length counts the NUL, which is the off-by-one
+    // every first implementation makes.
+    BsonString(v: Str)
+    // `0x03` — an embedded document.
+    BsonDocument(v: BsonDoc)
+    // `0x04` — an array, which the wire stores as a document with the
+    // keys `"0"`, `"1"`, `"2"` and so on.  Held here as a list, because
+    // the keys carry no information a reader wants; the reader checks
+    // them and `BsonBadArrayKey` is what it answers when they are wrong.
+    BsonArray(items: [BsonValue])
+    // `0x05` — binary data with a subtype byte.
+    BsonBinaryValue(v: BsonBinary)
+    // `0x06` — undefined.  Deprecated by BSON 1.1.  Read, never
+    // written; Extended JSON renders it as `{"$undefined": true}`.
+    BsonUndefined
+    // `0x07` — a twelve-byte ObjectId.
+    BsonObjectIdValue(v: BsonObjectId)
+    // `0x08` — a boolean, one byte, `0x00` or `0x01`.  Any other byte
+    // is `BsonUnknownType` at the reader rather than a silent `true`.
+    BsonBool(v: Bool)
+    // `0x09` — a UTC datetime: signed milliseconds since the Unix
+    // epoch, so a date before 1970 is negative.
+    //
+    // MILLISECONDS AND NOT AN INSTANT TYPE.  This package is `core` and
+    // has no clock, and the standard library's `Instant` is not a value
+    // a document can hold.  The element is the number the wire carries,
+    // and turning it into a civil date is calendar-nv's subject.
+    BsonDateTime(millis: Int)
+    // `0x0A` — null.
+    BsonNull
+    // `0x0B` — a regular expression: a pattern and its options, both C
+    // strings on the wire.
+    BsonRegexValue(v: BsonRegex)
+    // `0x0C` — a DBPointer.  Deprecated by BSON 1.1.  Read, never
+    // written.
+    BsonDbPointerValue(v: BsonDbPointer)
+    // `0x0D` — JavaScript source, as a string.  Not deprecated, and not
+    // evaluated by anything in this package.
+    BsonJavaScript(code: Str)
+    // `0x0E` — a symbol.  Deprecated by BSON 1.1.  Read, never written;
+    // a writer that wants the text writes a `BsonString`.
+    BsonSymbol(v: Str)
+    // `0x0F` — JavaScript source with a scope document.  Deprecated by
+    // BSON 1.1.  Read, never written.
+    BsonCodeWithScope(code: Str, scope: BsonDoc)
+    // `0x10` — a 32-bit signed integer.
+    //
+    // KEPT APART FROM `BsonInt64`, because the width is on the wire and
+    // a document that round-trips has to keep it.  A driver that widened
+    // every integer to 64 bits would change the bytes of every document
+    // it touched.
+    BsonInt32(v: Int)
+    // `0x11` — a replication timestamp.  An internal type; a date a
+    // user reads is `BsonDateTime`.
+    BsonTimestampValue(v: BsonTimestamp)
+    // `0x12` — a 64-bit signed integer.
+    BsonInt64(v: Int)
+    // `0x13` — a decimal128, carried as its sixteen bytes.
+    BsonDecimal128Value(v: BsonDecimal128)
+    // `0xFF` — the minimum key: a value that compares below every other
+    // value, used in a range bound.
+    BsonMinKey
+    // `0x7F` — the maximum key: a value that compares above every other
+    // value.
+    BsonMaxKey
+
+// One element of a document: a key and a value.
+//
+// A struct rather than a pair, because a document is a list of these
+// and a list of two-element lists would be a different document.
+pub struct BsonElem
+    // The key, as the wire's C string held it.  It may not contain a
+    // `0x00`; the reader answers `BsonEmbeddedNul` and the writer
+    // refuses.
+    key: Str
+    // The value.
+    value: BsonValue
+
+// A document: its elements, in the order they were written.
+//
+// The order is part of the document.  Nothing in this module sorts,
+// deduplicates or normalises it, so bytes read and written back are the
+// bytes that came in.
+pub struct BsonDoc
+    // The elements, in wire order, duplicates and all.
+    elems: [BsonElem]
+
+// The type code byte for a value: `1` for a double, `16` for an int32,
+// `255` for the minimum key.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     println("${bsonvalue.type_code(BsonMinKey)}")   // 255
+// ```
+pub fn type_code(v: BsonValue) -> Int []
+    todo("bson-nv.bsonvalue.type_code")
+
+// The type's name, as the specification's table writes it: `"double"`,
+// `"string"`, `"document"`, `"array"`, `"binData"`, `"undefined"`,
+// `"objectId"`, `"bool"`, `"date"`, `"null"`, `"regex"`, `"dbPointer"`,
+// `"javascript"`, `"symbol"`, `"javascriptWithScope"`, `"int"`,
+// `"timestamp"`, `"long"`, `"decimal"`, `"minKey"`, `"maxKey"`.
+//
+// These are the spellings the server's `$type` query operator uses, so
+// a program that filters by type says the same word this answers.
+pub fn type_name(v: BsonValue) -> Str []
+    todo("bson-nv.bsonvalue.type_name")
+
+// The `type_name` spelling a type code denotes, or `BsonUnknownType`.
+//
+// What a caller holding a raw type byte — from a server's `$type`
+// filter, from a hexdump — uses to name it without a document in hand.
+pub fn type_of_code(code: Int) -> Result<Str, BsonError> []
+    todo("bson-nv.bsonvalue.type_of_code")
+
+// Whether BSON 1.1 deprecates this element type.
+//
+// True for `BsonUndefined`, `BsonDbPointerValue`, `BsonSymbol`,
+// `BsonCodeWithScope`, and for a `BsonBinaryValue` whose subtype is
+// `BsonBinaryOld` or `BsonUuidOld`.  The writer refuses exactly this
+// set, so a caller that round-trips a document tests it first.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     println("${bsonvalue.is_deprecated(BsonSymbol("x"))}")   // true
+// ```
+pub fn is_deprecated(v: BsonValue) -> Bool []
+    todo("bson-nv.bsonvalue.is_deprecated")
+
+// The first key under which a deprecated element sits, searching the
+// whole document depth-first, or `None`.
+//
+// The one call that answers "will the writer take this document", and
+// the reason it answers a key rather than a boolean: a caller told
+// `false` still has to find the element.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     match bsonvalue.first_deprecated(bsonvalue.doc())
+//         Some(k) => println("cannot write: ${k}")
+//         None    => println("writable")
+// ```
+pub fn first_deprecated(d: BsonDoc) -> ?Str []
+    todo("bson-nv.bsonvalue.first_deprecated")
+
+// The double a value holds, or `BsonWrongType`.
+pub fn as_float(v: BsonValue) -> Result<Float, BsonError> []
+    todo("bson-nv.bsonvalue.as_float")
+
+// The integer a value holds, or `BsonWrongType`.
+//
+// Answers for `BsonInt32` and `BsonInt64` both, because the width is
+// the wire's business and a caller reading a count wants the number.  A
+// `BsonDouble` is NOT an integer here even when it has no fraction: a
+// caller that wants that rounding does it itself, where it can see it.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     match bsonvalue.as_int(BsonInt64(9))
+//         Ok(n)  => println("${n}")   // 9
+//         Err(e) => println(e.message())
+// ```
+pub fn as_int(v: BsonValue) -> Result<Int, BsonError> []
+    todo("bson-nv.bsonvalue.as_int")
+
+// The string a value holds, or `BsonWrongType`.
+//
+// `BsonString` only.  A `BsonSymbol` and a `BsonJavaScript` are also
+// text on the wire and neither answers here, because a program that
+// treated a symbol as a string is a program that will write it back as
+// one and change the document.
+pub fn as_str(v: BsonValue) -> Result<Str, BsonError> []
+    todo("bson-nv.bsonvalue.as_str")
+
+// The boolean a value holds, or `BsonWrongType`.
+pub fn as_bool(v: BsonValue) -> Result<Bool, BsonError> []
+    todo("bson-nv.bsonvalue.as_bool")
+
+// The binary payload a value holds, or `BsonWrongType`.
+//
+// The subtype comes with it, because a caller that wanted the bytes
+// without the tag would be throwing away the one thing that makes a
+// binary element more than bytes.
+pub fn as_binary(v: BsonValue) -> Result<BsonBinary, BsonError> []
+    todo("bson-nv.bsonvalue.as_binary")
+
+// The embedded document a value holds, or `BsonWrongType`.
+pub fn as_doc(v: BsonValue) -> Result<BsonDoc, BsonError> []
+    todo("bson-nv.bsonvalue.as_doc")
+
+// The array a value holds, or `BsonWrongType`.
+pub fn as_array(v: BsonValue) -> Result<[BsonValue], BsonError> []
+    todo("bson-nv.bsonvalue.as_array")
+
+// The ObjectId a value holds, or `BsonWrongType`.
+pub fn as_object_id(v: BsonValue) -> Result<BsonObjectId, BsonError> []
+    todo("bson-nv.bsonvalue.as_object_id")
+
+// The UTC datetime a value holds, in signed milliseconds since the Unix
+// epoch, or `BsonWrongType`.
+//
+// A number and not a date: this package is `core`, it has no clock, and
+// turning milliseconds into a civil date is calendar-nv's subject.
+pub fn as_datetime_millis(v: BsonValue) -> Result<Int, BsonError> []
+    todo("bson-nv.bsonvalue.as_datetime_millis")
+
+// The decimal128 a value holds, or `BsonWrongType`.
+pub fn as_decimal128(v: BsonValue) -> Result<BsonDecimal128, BsonError> []
+    todo("bson-nv.bsonvalue.as_decimal128")
+
+// An empty document.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     println("${bsonvalue.len(bsonvalue.doc())}")   // 0
+// ```
+pub fn doc() -> BsonDoc []
+    todo("bson-nv.bsonvalue.doc")
+
+// A document from elements, in the order given.
+pub fn doc_of(elems: [BsonElem]) -> BsonDoc []
+    todo("bson-nv.bsonvalue.doc_of")
+
+// One element.
+pub fn elem(key: Str, value: BsonValue) -> BsonElem []
+    todo("bson-nv.bsonvalue.elem")
+
+// `d` with one more element at the end.
+//
+// APPEND, NOT INSERT-OR-REPLACE.  A document may carry the same key
+// twice and this is how a test builds one; `replace` is the function
+// that changes a value in place.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     let d = bsonvalue.append(bsonvalue.doc(), "n", BsonInt32(1))
+//     println("${bsonvalue.len(d)}")   // 1
+// ```
+pub fn append(d: BsonDoc, key: Str, value: BsonValue) -> BsonDoc []
+    todo("bson-nv.bsonvalue.append")
+
+// How many elements the document has, counting duplicates.
+pub fn len(d: BsonDoc) -> Int []
+    todo("bson-nv.bsonvalue.len")
+
+// The element at an offset, or `None`.
+pub fn at(d: BsonDoc, index: Int) -> ?BsonElem []
+    todo("bson-nv.bsonvalue.at")
+
+// Every key, in wire order, duplicates included.
+pub fn keys(d: BsonDoc) -> [Str] []
+    todo("bson-nv.bsonvalue.keys")
+
+// The value of the FIRST element with this key, or `BsonNoSuchKey`.
+//
+// The first and not the last, because that is the element a BSON reader
+// meets first and the one a server uses when it accepts such a document
+// at all.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     match bsonvalue.get(bsonvalue.doc(), "_id")
+//         Ok(_)  => println("this cannot happen — the document is empty")
+//         Err(e) => println(e.message())
+// ```
+pub fn get(d: BsonDoc, key: Str) -> Result<BsonValue, BsonError> []
+    todo("bson-nv.bsonvalue.get")
+
+// The same lookup as an option, for a caller with a default in hand.
+pub fn lookup(d: BsonDoc, key: Str) -> ?BsonValue []
+    todo("bson-nv.bsonvalue.lookup")
+
+// Whether any element has this key.
+pub fn has(d: BsonDoc, key: Str) -> Bool []
+    todo("bson-nv.bsonvalue.has")
+
+// How many elements have this key.
+//
+// THE DUPLICATE-KEY DETECTOR.  A document with two `_id` elements is
+// one the server rejects and one a file on disk may still contain, and
+// this is the only way to find out, because `get` answers the first and
+// says nothing about the second.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     println("${bsonvalue.count_of(bsonvalue.doc(), "_id")}")   // 0
+// ```
+pub fn count_of(d: BsonDoc, key: Str) -> Int []
+    todo("bson-nv.bsonvalue.count_of")
+
+// `d` with the first element of this key given a new value, keeping its
+// position; `d` with the element appended when there was none.
+//
+// Position is kept because the order is part of the document.
+pub fn replace(d: BsonDoc, key: Str, value: BsonValue) -> BsonDoc []
+    todo("bson-nv.bsonvalue.replace")
+
+// `d` without any element of this key.
+//
+// Every one of them, not the first: a caller removing a key wants it
+// gone.
+pub fn remove(d: BsonDoc, key: Str) -> BsonDoc []
+    todo("bson-nv.bsonvalue.remove")
+
+// The value at a path of keys, descending through embedded documents,
+// or `None`.
+//
+// Keys only.  An array index is not a key, and a caller walking into an
+// array takes the `BsonArray` and indexes the list itself — which keeps
+// this function from having to decide what `"0"` means in a document
+// that really does have a key `"0"`.
+//
+// ```novo
+// use bsonvalue
+//
+// fn main() [io]
+//     match bsonvalue.path(bsonvalue.doc(), ["a", "b"])
+//         Some(_) => println("found")
+//         None    => println("no such path")
+// ```
+pub fn path(d: BsonDoc, keys: [Str]) -> ?BsonValue []
+    todo("bson-nv.bsonvalue.path")
+
+// The document an array is stored as: the same values under the keys
+// `"0"`, `"1"`, `"2"` and so on.
+//
+// What the writer emits for a `BsonArray`, exposed because a caller
+// that wants to see the bytes an array costs is asking about exactly
+// this.
+pub fn array_doc(items: [BsonValue]) -> BsonDoc []
+    todo("bson-nv.bsonvalue.array_doc")
+
+// Whether a document's keys are `"0"`, `"1"`, `"2"` and so on with no
+// gaps, so that it is the wire form of an array.
+//
+// The check the reader performs on every `0x04` element.
+pub fn is_array_doc(d: BsonDoc) -> Bool []
+    todo("bson-nv.bsonvalue.is_array_doc")

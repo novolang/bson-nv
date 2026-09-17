@@ -1,0 +1,152 @@
+// bsonerror — every refusal this package can produce, and the one
+// sentence each of them renders to.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THE ERRORS ARE THEIR OWN MODULE.  Three surfaces refuse — the
+// reader, the writer and the Extended JSON conversion — and all three
+// refuse for overlapping reasons.  A document whose declared length
+// does not match its bytes is a reader fault; a document containing an
+// element type the writer will not emit is a writer fault; a
+// `$numberDecimal` whose text is not a decimal number is a conversion
+// fault.  One taxonomy means a caller that funnels all three into one
+// log line writes one match.
+//
+// EVERY FAULT CARRIES A BYTE OFFSET.  BSON is a length-prefixed format
+// with no line structure, so "invalid document" is not a diagnosis.
+// `at` is the offset from the start of the buffer the reader was
+// handed, which is what a caller dumping the surrounding bytes needs.
+
+// What went wrong.
+//
+// The offsets are from the start of the buffer passed to the reader,
+// not from the start of the enclosing document, so a fault inside a
+// nested array reports where it really is.
+pub enum BsonError
+    // The buffer ended before the element or the document did.  `need`
+    // is how many more bytes the length prefix or the type said were
+    // coming.
+    BsonTruncated(at: Int, need: Int)
+    // The four-byte little-endian length at the head of a document is
+    // not the number of bytes the document occupies.  BSON 1.1 § the
+    // document grammar makes the prefix normative, so a mismatch is a
+    // refusal rather than something to recover from.
+    BsonBadDocumentLength(at: Int, declared: Int, actual: Int)
+    // A document did not end with the `0x00` terminator its length
+    // accounted for.
+    BsonMissingTerminator(at: Int)
+    // An element type byte that BSON 1.1 does not assign.
+    BsonUnknownType(at: Int, code: Int)
+    // A binary element's subtype byte is in the reserved range that
+    // BSON 1.1 neither assigns nor opens to users — anything from
+    // `0x09` to `0x7F` that the specification has not named.
+    BsonReservedSubtype(at: Int, subtype: Int)
+    // A binary element of the old subtype `0x02`, whose payload is a
+    // second length prefix, whose inner length does not agree with the
+    // outer one.
+    BsonBadOldBinary(at: Int, outer: Int, inner: Int)
+    // A UTF-8 string element whose bytes are not UTF-8.
+    BsonBadUtf8(at: Int)
+    // A key or a regex pattern that contains an embedded `0x00`.  Both
+    // are C strings on the wire, so a NUL inside one truncates it, and
+    // a writer that emitted it would produce a document no reader
+    // reconstructs.
+    BsonEmbeddedNul(at: Int, key: Str)
+    // An array element whose keys are not `"0"`, `"1"`, `"2"` and so on
+    // in order.  BSON stores an array as a document with decimal string
+    // keys, and a document that breaks the rule is not an array.
+    BsonBadArrayKey(at: Int, saw: Str)
+    // The document nested deeper than the reader's limit.
+    //
+    // Not pedantry: an embedded document head costs five bytes and
+    // opens a level, so a reader with no limit is a stack overflow that
+    // arrives as a short message.
+    BsonDepthExceeded(at: Int, depth: Int)
+    // A document was read and bytes were left over.
+    BsonTrailingBytes(at: Int, len: Int)
+    // An accessor was asked for one type and the element was another.
+    // `want` and `saw` are `type_name`'s spellings.
+    BsonWrongType(at: Int, want: Str, saw: Str)
+    // A key the caller asked for is not in the document.
+    BsonNoSuchKey(key: Str)
+    // The writer was handed an element type BSON 1.1 deprecates and
+    // this package will not emit: undefined, DBPointer, symbol,
+    // JavaScript code with scope, or a binary element of subtype
+    // `0x02` or `0x03`.  `type_name`'s spelling of the type is in
+    // `saw`, and the key it sat under is in `key`.
+    BsonDeprecatedOnWrite(key: Str, saw: Str)
+    // A decimal128 whose sixteen bytes are not a value the IEEE 754-2008
+    // decimal128 interchange format defines.
+    BsonBadDecimal128(at: Int)
+    // An ObjectId that is not exactly twelve bytes.
+    BsonBadObjectId(at: Int, len: Int)
+    // A regex whose options are not the letters BSON 1.1 permits —
+    // `i`, `l`, `m`, `s`, `u`, `x` — in alphabetical order.
+    BsonBadRegexOptions(at: Int, saw: Str)
+    // An Extended JSON object whose single `$`-prefixed member names a
+    // wrapper this package does not know.
+    BsonUnknownExtendedType(key: Str)
+    // An Extended JSON wrapper whose payload is not the shape its type
+    // requires — a `$oid` that is not twenty-four hex characters, a
+    // `$numberLong` that is not a decimal string, a `$binary` with no
+    // `subType`.
+    BsonBadExtendedPayload(key: Str, why: Str)
+    // A JSON value with no BSON element type: a number too large for a
+    // double and not written as one of the Extended JSON integer
+    // wrappers.
+    BsonUnrepresentableJson(why: Str)
+
+// The standard `Error` implementation, so a bad document can be
+// reported by anything that reports errors.
+impl Error for BsonError
+    // Answer the one-line report: what was wrong, and where.
+    fn message(self) -> Str
+        todo("bson-nv.bsonerror.BsonError.message")
+
+// The byte offset a fault was found at, or `0` for the faults that are
+// about a key rather than about a position.
+//
+// What a caller dumping the bytes around a fault reads.
+//
+// ```novo
+// use bsonerror
+//
+// fn main() [io]
+//     println("${bsonerror.offset_of(BsonMissingTerminator(41))}")   // 41
+// ```
+pub fn offset_of(e: BsonError) -> Int []
+    todo("bson-nv.bsonerror.offset_of")
+
+// Whether the fault is in the document rather than in the request.
+//
+// True for everything the reader can find in a buffer, false for
+// `BsonNoSuchKey`, `BsonWrongType` and the writer's own refusals — the
+// faults that say the caller asked for the wrong thing rather than
+// that the bytes are bad.  A service deciding between "the stored
+// document is corrupt" and "this query is wrong" is asking exactly
+// this.
+//
+// ```novo
+// use bsonerror
+//
+// fn main() [io]
+//     println("${bsonerror.is_document_fault(BsonNoSuchKey("_id"))}")   // false
+// ```
+pub fn is_document_fault(e: BsonError) -> Bool []
+    todo("bson-nv.bsonerror.is_document_fault")
+
+// A short, stable name for the fault, for a metric label or a test.
+//
+// The variant's own spelling with the `Bson` prefix removed and the
+// words separated by hyphens: `"truncated"`, `"bad-document-length"`,
+// `"deprecated-on-write"`.
+//
+// ```novo
+// use bsonerror
+//
+// fn main() [io]
+//     println(bsonerror.code_of(BsonTruncated(0, 4)))   // truncated
+// ```
+pub fn code_of(e: BsonError) -> Str []
+    todo("bson-nv.bsonerror.code_of")

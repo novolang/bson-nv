@@ -1,0 +1,425 @@
+// bsontype — the scalar element types that are more than a number: the
+// ObjectId, the binary element and its subtype table, the regular
+// expression, the replication timestamp and the decimal128.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHY THESE ARE A MODULE AND NOT FIELDS OF THE VALUE ENUM.  Each of
+// them has rules of its own that a caller has to be able to ask about
+// without having a whole document in hand: twelve bytes and not eleven;
+// a subtype byte that is assigned, user-defined or reserved; regex
+// options that are a subset of six letters in alphabetical order; a
+// decimal128 that may be a quiet NaN.  A caller validating input before
+// it builds a document reaches for exactly this module.
+//
+// DECIMAL128 IS CARRIED, NOT COMPUTED.  A decimal128 is the sixteen
+// bytes IEEE 754-2008 defines for the decimal128 interchange format,
+// held here as the two 64-bit halves in the order the wire has them.
+// This package reads them, writes them back unchanged and renders them
+// to the string form MongoDB's Extended JSON uses.  It offers no
+// arithmetic: adding two of them is decimal-nv's subject, and a package
+// that did half of it here would be a second, worse decimal.
+
+// A twelve-byte ObjectId.
+//
+// The MongoDB ObjectId specification fixes the layout: a four-byte
+// big-endian seconds-since-epoch timestamp, a five-byte per-process
+// random value, and a three-byte big-endian counter.  A reader can take
+// the timestamp apart, which is what `object_id_timestamp` is for.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.object_id_from_hex("507f1f77bcf86cd799439011")
+//         Ok(o)  => println(bsontype.object_id_hex(o))
+//         Err(e) => println(e.message())
+// ```
+pub struct BsonObjectId
+    // Exactly twelve bytes.  Every constructor in this module checks
+    // the length, so a value of this type always has them.
+    raw: Bytes
+
+// What a binary element's payload is.
+//
+// The byte after a binary element's length, and the reason a binary
+// element is not just bytes: a driver that stores a UUID and a driver
+// that stores a checksum both write subtype-tagged bytes, and reading
+// them back as the same thing loses the tag.
+pub enum BsonSubtype
+    // `0x00` — generic binary, and what a caller with no better answer
+    // uses.
+    BsonGeneric
+    // `0x01` — a function.
+    BsonFunction
+    // `0x02` — binary, old.  The payload carries a SECOND four-byte
+    // little-endian length before the data.  Read, never written.
+    BsonBinaryOld
+    // `0x03` — UUID, old.  The same sixteen bytes as `BsonUuid` in a
+    // byte order that differed per driver, which is why it was
+    // replaced.  Read, never written.
+    BsonUuidOld
+    // `0x04` — a UUID, sixteen bytes, RFC 4122 byte order.
+    BsonUuid
+    // `0x05` — an MD5 digest, sixteen bytes.
+    BsonMd5
+    // `0x06` — an encrypted payload, written by client-side field level
+    // encryption.  This package neither encrypts nor decrypts; the
+    // bytes pass through.
+    BsonEncrypted
+    // `0x07` — a compressed column, written by the column store.
+    BsonCompressedColumn
+    // `0x08` — a sensitive value a driver should keep out of logs.
+    BsonSensitive
+    // `0x80` to `0xFF` — user-defined.  `code` is the byte itself, so a
+    // caller with two of its own subtypes tells them apart.
+    BsonUserDefined(code: Int)
+
+// A binary element: a subtype and the bytes it tags.
+//
+// ```novo
+// use std.bytes
+// use bsontype
+//
+// fn main() [io]
+//     let b = bsontype.binary(BsonUuid, bytes.zeros(16))
+//     println("${bsontype.subtype_code(b.subtype)}")   // 4
+// ```
+pub struct BsonBinary
+    // The tag on the payload.
+    subtype: BsonSubtype
+    // The payload, with the old subtype's inner length prefix already
+    // stripped — a caller reading a `BsonBinaryOld` gets the data, not
+    // the data behind another four bytes.
+    data: Bytes
+
+// A regular expression element: a pattern and its options.
+//
+// This package does NOT compile the pattern.  BSON stores a PCRE
+// pattern as text, and what a program does with it is regex-nv's
+// subject or the server's.  What is checked here is the part BSON
+// itself fixes: the options are a subset of `ilmsux`, in alphabetical
+// order, and neither string may contain a `0x00`.
+pub struct BsonRegex
+    // The pattern, exactly as the document held it.
+    pattern: Str
+    // The option letters, alphabetical: `i` case-insensitive, `l`
+    // locale-dependent, `m` multiline, `s` dotall, `u` Unicode, `x`
+    // verbose.
+    options: Str
+
+// A replication timestamp: the special internal type `0x11`.
+//
+// NOT a moment a program should show a user.  It is a 64-bit value the
+// server uses for ordering within the oplog — the high half seconds,
+// the low half a counter that distinguishes two operations in the same
+// second.  A date a user reads is a UTC datetime element, `0x09`.
+pub struct BsonTimestamp
+    // The high thirty-two bits: seconds since the Unix epoch.
+    seconds: Int
+    // The low thirty-two bits: an ordinal within that second.
+    increment: Int
+
+// A decimal128, as the sixteen bytes the wire held.
+//
+// IEEE 754-2008's decimal128 interchange format: one sign bit, a
+// combination field that carries the exponent and the leading digit,
+// and a trailing significand.  The two halves are named for their
+// position in the value, not for their position in the buffer — the
+// wire is little-endian, so `low` comes first in the bytes.
+pub struct BsonDecimal128
+    // Bits 64 to 127, sign and combination field included.
+    high: Int
+    // Bits 0 to 63.
+    low: Int
+
+// A DBPointer element: a collection name and an ObjectId.
+//
+// BSON 1.1 deprecates it.  It is read, so a document written by an old
+// driver can be inspected, and it is never written.
+pub struct BsonDbPointer
+    // The namespace the pointer names, as the document held it.
+    namespace: Str
+    // The ObjectId it points at.
+    id: BsonObjectId
+
+// An ObjectId from twelve bytes.
+//
+// `BsonBadObjectId` when the length is anything else, because a
+// shorter one would be padded and a longer one truncated, and both
+// produce an identifier that is not the one the caller meant.
+//
+// ```novo
+// use std.bytes
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.object_id(bytes.zeros(11))
+//         Ok(_)  => println("this cannot happen")
+//         Err(e) => println(e.message())
+// ```
+pub fn object_id(raw: Bytes) -> Result<BsonObjectId, BsonError> []
+    todo("bson-nv.bsontype.object_id")
+
+// An ObjectId from twenty-four lowercase or uppercase hex characters.
+//
+// The spelling a JSON document, a URL and a shell all carry it in.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.object_id_from_hex("507f1f77bcf86cd799439011")
+//         Ok(o)  => println("${bsontype.object_id_timestamp(o)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn object_id_from_hex(hex: Str) -> Result<BsonObjectId, BsonError> []
+    todo("bson-nv.bsontype.object_id_from_hex")
+
+// An ObjectId assembled from its three fields.
+//
+// THE CONSTRUCTOR THAT MAKES THIS PACKAGE `core`.  Generating a fresh
+// ObjectId needs a clock for the timestamp and a random source for the
+// five-byte per-process value, and this package may read neither.  So
+// the caller reads them — one `[time]` call and one `[rand]` call, in
+// the host, where they are visible — and hands the parts over.
+//
+// `random` must be five bytes; `timestamp` is seconds since the Unix
+// epoch and `counter` is taken modulo 2^24, because the counter field
+// is three bytes and wrapping is what the specification says it does.
+//
+// ```novo
+// use std.bytes
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.object_id_from_parts(1700000000, bytes.zeros(5), 1)
+//         Ok(o)  => println("${bsontype.object_id_counter(o)}")   // 1
+//         Err(e) => println(e.message())
+// ```
+pub fn object_id_from_parts(timestamp: Int, random: Bytes,
+                            counter: Int) -> Result<BsonObjectId, BsonError> []
+    todo("bson-nv.bsontype.object_id_from_parts")
+
+// The twelve bytes.
+pub fn object_id_bytes(o: BsonObjectId) -> Bytes []
+    todo("bson-nv.bsontype.object_id_bytes")
+
+// The twenty-four lowercase hex characters.
+//
+// ```novo
+// use std.bytes
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.object_id(bytes.zeros(12))
+//         Ok(o)  => println(bsontype.object_id_hex(o))
+//         Err(e) => println(e.message())
+// ```
+pub fn object_id_hex(o: BsonObjectId) -> Str []
+    todo("bson-nv.bsontype.object_id_hex")
+
+// The seconds-since-epoch the first four bytes hold.
+//
+// An ObjectId sorts by creation time because this field is first and
+// big-endian, which is why a collection with no other index can still
+// be paged by `_id`.
+pub fn object_id_timestamp(o: BsonObjectId) -> Int []
+    todo("bson-nv.bsontype.object_id_timestamp")
+
+// The three-byte counter the last bytes hold.
+pub fn object_id_counter(o: BsonObjectId) -> Int []
+    todo("bson-nv.bsontype.object_id_counter")
+
+// The five-byte per-process random value.
+pub fn object_id_random(o: BsonObjectId) -> Bytes []
+    todo("bson-nv.bsontype.object_id_random")
+
+// A binary element.
+//
+// The bytes are taken as they are; nothing here checks that a
+// `BsonUuid` payload is sixteen bytes, because the reader has to be
+// able to hand back a document that broke the rule rather than lose it.
+// `binary_check` is the function that asks.
+pub fn binary(subtype: BsonSubtype, data: Bytes) -> BsonBinary []
+    todo("bson-nv.bsontype.binary")
+
+// Whether a binary element's payload is the length its subtype fixes.
+//
+// `Ok(true)` when the subtype has no fixed length or the payload matches
+// it, `BsonWrongType` naming the expected length otherwise.  `BsonUuid`
+// and `BsonUuidOld` are sixteen bytes and `BsonMd5` is sixteen; the
+// rest are any length.
+pub fn binary_check(b: BsonBinary) -> Result<Bool, BsonError> []
+    todo("bson-nv.bsontype.binary_check")
+
+// The subtype byte.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     println("${bsontype.subtype_code(BsonMd5)}")   // 5
+// ```
+pub fn subtype_code(s: BsonSubtype) -> Int []
+    todo("bson-nv.bsontype.subtype_code")
+
+// The subtype a byte denotes.
+//
+// `BsonReservedSubtype` for anything between `0x09` and `0x7F`, which
+// BSON 1.1 neither assigns nor opens to users.  A reader that accepted
+// those would be accepting a document a future version of the format
+// will give a meaning to.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.subtype_of_code(16)
+//         Ok(_)  => println("this cannot happen")
+//         Err(e) => println(e.message())
+// ```
+pub fn subtype_of_code(code: Int) -> Result<BsonSubtype, BsonError> []
+    todo("bson-nv.bsontype.subtype_of_code")
+
+// The subtype's name, as the specification's table writes it:
+// `"generic"`, `"function"`, `"binary-old"`, `"uuid-old"`, `"uuid"`,
+// `"md5"`, `"encrypted"`, `"compressed-column"`, `"sensitive"`,
+// `"user-defined"`.
+pub fn subtype_name(s: BsonSubtype) -> Str []
+    todo("bson-nv.bsontype.subtype_name")
+
+// Whether the subtype is one BSON 1.1 deprecates: `BsonBinaryOld` and
+// `BsonUuidOld`.
+//
+// The writer refuses both, so this is the question a caller asks before
+// it tries to write a document it read.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     println("${bsontype.is_deprecated_subtype(BsonUuidOld)}")   // true
+// ```
+pub fn is_deprecated_subtype(s: BsonSubtype) -> Bool []
+    todo("bson-nv.bsontype.is_deprecated_subtype")
+
+// A regular expression element.
+//
+// The options are not sorted or filtered here.  `regex_check` is the
+// function that asks, so a reader can hand back a document whose
+// options were written in the wrong order without losing it.
+pub fn regex(pattern: Str, options: Str) -> BsonRegex []
+    todo("bson-nv.bsontype.regex")
+
+// Whether a regex's options are the letters BSON 1.1 permits, in
+// alphabetical order, with no repeats.
+//
+// `BsonBadRegexOptions` naming what was seen otherwise.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.regex_check(bsontype.regex("^a", "mi"))
+//         Ok(_)  => println("this cannot happen — `mi` is out of order")
+//         Err(e) => println(e.message())
+// ```
+pub fn regex_check(r: BsonRegex) -> Result<Bool, BsonError> []
+    todo("bson-nv.bsontype.regex_check")
+
+// A replication timestamp from its two halves.
+//
+// Each is taken modulo 2^32.
+pub fn timestamp(seconds: Int, increment: Int) -> BsonTimestamp []
+    todo("bson-nv.bsontype.timestamp")
+
+// The timestamp as the single 64-bit value the wire carries.
+//
+// `seconds * 2^32 + increment`, which is what the server compares, so
+// two timestamps order correctly through this and not through their
+// fields separately.
+pub fn timestamp_u64(t: BsonTimestamp) -> Int []
+    todo("bson-nv.bsontype.timestamp_u64")
+
+// A decimal128 from its two 64-bit halves.
+pub fn decimal128(high: Int, low: Int) -> BsonDecimal128 []
+    todo("bson-nv.bsontype.decimal128")
+
+// A decimal128 from the sixteen little-endian bytes the wire holds.
+//
+// `BsonBadDecimal128` when the length is not sixteen.
+//
+// ```novo
+// use std.bytes
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.decimal128_from_bytes(bytes.zeros(16))
+//         Ok(d)  => println(bsontype.decimal128_to_str(d))
+//         Err(e) => println(e.message())
+// ```
+pub fn decimal128_from_bytes(raw: Bytes) -> Result<BsonDecimal128, BsonError> []
+    todo("bson-nv.bsontype.decimal128_from_bytes")
+
+// The sixteen little-endian bytes, as the wire has them.
+//
+// A document read and written back produces these bytes unchanged, so a
+// value this package cannot interpret is not a value it can damage.
+pub fn decimal128_bytes(d: BsonDecimal128) -> Bytes []
+    todo("bson-nv.bsontype.decimal128_bytes")
+
+// Whether the combination field says NaN.
+//
+// A decimal128 NaN is quiet or signalling and carries a payload, and
+// both survive a round trip here because the bytes do.
+pub fn decimal128_is_nan(d: BsonDecimal128) -> Bool []
+    todo("bson-nv.bsontype.decimal128_is_nan")
+
+// Whether the combination field says infinity.
+pub fn decimal128_is_infinite(d: BsonDecimal128) -> Bool []
+    todo("bson-nv.bsontype.decimal128_is_infinite")
+
+// Whether the sign bit is set.
+//
+// Set on a negative zero too, which is a value decimal128 has and a
+// binary double also has; neither is equal to positive zero by bit
+// pattern and both are by arithmetic.
+pub fn decimal128_is_negative(d: BsonDecimal128) -> Bool []
+    todo("bson-nv.bsontype.decimal128_is_negative")
+
+// The value in the string form the MongoDB Extended JSON specification
+// fixes for `$numberDecimal`.
+//
+// `"NaN"`, `"Infinity"`, `"-Infinity"`, and otherwise the shortest
+// scientific or plain notation that reproduces the same coefficient and
+// exponent — `"0.001"` and not `"1E-3"` where the exponent is small
+// enough, because the specification's to-string rules say so.
+pub fn decimal128_to_str(d: BsonDecimal128) -> Str []
+    todo("bson-nv.bsontype.decimal128_to_str")
+
+// A decimal128 from that same string form.
+//
+// `BsonBadDecimal128` when the text is not one, and a value whose
+// exponent is outside the format's range is clamped the way the
+// specification's from-string rules clamp it rather than refused.
+//
+// ```novo
+// use bsontype
+//
+// fn main() [io]
+//     match bsontype.decimal128_from_str("-1.2345E+30")
+//         Ok(d)  => println(bsontype.decimal128_to_str(d))
+//         Err(e) => println(e.message())
+// ```
+pub fn decimal128_from_str(text: Str) -> Result<BsonDecimal128, BsonError> []
+    todo("bson-nv.bsontype.decimal128_from_str")
+
+// A DBPointer from a namespace and an ObjectId.
+//
+// Constructible so that a reader can hand one back, and refused by the
+// writer.  There is no route from one of these to a document this
+// package will emit, which is what "read, never written" means here.
+pub fn db_pointer(namespace: Str, id: BsonObjectId) -> BsonDbPointer []
+    todo("bson-nv.bsontype.db_pointer")

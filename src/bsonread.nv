@@ -1,0 +1,185 @@
+// bsonread — bytes to a document.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// ONE BUFFER, ONE DOCUMENT.  BSON is length-prefixed from the outside
+// in: the first four bytes say how long the whole document is, so a
+// reader that has fewer bytes than that knows it immediately and a
+// reader that has more knows there is another document behind this one.
+// There is no feed-and-drain decoder here for that reason — a caller
+// reading a stream reads the four-byte length, waits for that many
+// bytes, and calls `read`.  `document_length` is the function that does
+// the first half.
+//
+// THE READER IS TOLERANT OF NOTHING.  Every fault BSON 1.1 makes
+// possible is a named refusal in `bsonerror`, and none of them is
+// recovered from.  A tolerant BSON reader is a security problem: the
+// bytes come from a database or from the wire, the length prefixes are
+// attacker-controlled, and "read as much as parses" is how a reader
+// walks off the end of a buffer.
+//
+// EVERY TYPE READS.  The five element types BSON 1.1 deprecates —
+// undefined, DBPointer, symbol, code-with-scope, and the two old binary
+// subtypes — come back as their own arms of `BsonValue`.  A reader that
+// refused them could not open a document written by an old driver,
+// which is the case that needs a reader most.  The refusal is the
+// writer's.
+
+// What a reader is configured with.
+//
+// A value rather than a pile of arguments, so a service sets it once
+// and a test sets it differently.
+pub struct BsonLimits
+    // How deep an embedded document or array may nest.  A document head
+    // costs five bytes and opens a level, so a reader without a limit is
+    // a stack overflow that arrives as a short message.
+    max_depth: Int
+    // The largest document, in bytes, the reader will accept.  The
+    // server's own limit is 16 MiB for a stored document; a reader
+    // handed a length prefix larger than it is willing to hold should
+    // refuse before it allocates, which is what this is for.
+    max_document_bytes: Int
+    // Whether a key containing a `.` or starting with `$` is refused.
+    //
+    // False by default, because the format permits both and a reader
+    // that refused them could not read a document the server itself
+    // writes.  A service validating user input sets it true.
+    refuse_reserved_keys: Bool
+
+// The limits a reader uses when none are given: sixty-four levels, the
+// server's own 16 MiB document ceiling, and reserved keys accepted.
+//
+// ```novo
+// use bsonread
+//
+// fn main() [io]
+//     println("${bsonread.default_limits().max_depth}")   // 64
+// ```
+pub fn default_limits() -> BsonLimits []
+    todo("bson-nv.bsonread.default_limits")
+
+// The document length the first four bytes declare.
+//
+// THE FUNCTION A STREAM READER CALLS FIRST.  It answers without
+// touching the rest of the buffer, so a caller reading a socket asks
+// for exactly that many bytes and then calls `read`.  `BsonTruncated`
+// when there are fewer than four bytes.
+//
+// ```novo
+// use std.bytes
+// use bsonread
+//
+// fn main() [io]
+//     match bsonread.document_length(bytes.zeros(2))
+//         Ok(_)  => println("this cannot happen")
+//         Err(e) => println(e.message())
+// ```
+pub fn document_length(src: Bytes) -> Result<Int, BsonError> []
+    todo("bson-nv.bsonread.document_length")
+
+// One document from a whole buffer.
+//
+// `BsonTrailingBytes` when the buffer is longer than the document's own
+// length prefix, because a caller handing over one buffer meant one
+// document and silently ignoring the rest is how a second document goes
+// missing.  `read_prefix` is for the caller that meant otherwise.
+//
+// ```novo
+// use std.bytes
+// use bsonread
+// use bsonvalue
+//
+// fn main() [io]
+//     match bsonread.read(bytes.from_hex("0500000000") ?? bytes.zeros(0))
+//         Ok(d)  => println("${bsonvalue.len(d)}")   // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn read(src: Bytes) -> Result<BsonDoc, BsonError> []
+    todo("bson-nv.bsonread.read")
+
+// The same, under limits the caller chose.
+pub fn read_with(src: Bytes, limits: BsonLimits) -> Result<BsonDoc, BsonError> []
+    todo("bson-nv.bsonread.read_with")
+
+// What one document took out of a longer buffer.
+//
+// `consumed` is the document's own length, so the next document starts
+// there.  A caller reading a file of concatenated documents — a mongodump
+// archive, an oplog dump — loops on this.
+pub struct BsonPrefix
+    // The document that was read.
+    value: BsonDoc
+    // How many bytes it occupied.
+    consumed: Int
+
+// One document from the front of a buffer, leaving the rest.
+//
+// ```novo
+// use std.bytes
+// use bsonread
+//
+// fn main() [io]
+//     match bsonread.read_prefix(bytes.from_hex("0500000000") ?? bytes.zeros(0))
+//         Ok(p)  => println("${p.consumed}")   // 5
+//         Err(e) => println(e.message())
+// ```
+pub fn read_prefix(src: Bytes) -> Result<BsonPrefix, BsonError> []
+    todo("bson-nv.bsonread.read_prefix")
+
+// The same, under limits the caller chose.
+pub fn read_prefix_with(src: Bytes, limits: BsonLimits) -> Result<BsonPrefix, BsonError> []
+    todo("bson-nv.bsonread.read_prefix_with")
+
+// Every document in a buffer of concatenated documents.
+//
+// The shape a mongodump archive and an oplog file both have.  The first
+// fault stops the walk and is answered, so a caller never gets a partial
+// list it might mistake for the whole file.
+pub fn read_all(src: Bytes) -> Result<[BsonDoc], BsonError> []
+    todo("bson-nv.bsonread.read_all")
+
+// Whether a buffer is a document this reader accepts, with no document
+// built.
+//
+// The check a validator runs over a large file: it walks the same
+// structure `read` walks and allocates nothing for the values, so a
+// caller that only wants to know whether the bytes are sound does not
+// pay for the tree.
+pub fn validate(src: Bytes) -> Result<Bool, BsonError> []
+    todo("bson-nv.bsonread.validate")
+
+// The byte range one key's VALUE occupies inside the buffer, without
+// building the document.
+//
+// `None` when the key is absent.  What a caller extracting one field
+// out of a large stored document uses — an `_id` out of a megabyte of
+// document costs the scan and no allocation — and what a caller that
+// must re-sign the exact original bytes of a sub-document needs, since
+// reading and writing a document back is not guaranteed to reproduce
+// them when the document held a deprecated type.
+//
+// ```novo
+// use std.bytes
+// use bsonread
+//
+// fn main() [io]
+//     match bsonread.value_span(bytes.from_hex("0500000000") ?? bytes.zeros(0), "_id")
+//         Ok(_)  => println("found or not")
+//         Err(e) => println(e.message())
+// ```
+pub fn value_span(src: Bytes, key: Str) -> Result<?BsonSpan, BsonError> []
+    todo("bson-nv.bsonread.value_span")
+
+// A half-open byte range inside the buffer the reader was handed.
+//
+// Offsets from the start of that buffer, so a caller slices with them
+// directly.
+pub struct BsonSpan
+    // The first byte.
+    from: Int
+    // One past the last byte.
+    to: Int
+    // The element's type code, so a caller knows what the span holds
+    // without reading it.
+    type_code: Int

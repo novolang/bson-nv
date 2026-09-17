@@ -1,0 +1,130 @@
+// bsonwrite — a document to bytes.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// THE WRITER EMITS THE CURRENT TYPES AND REFUSES THE DEPRECATED ONES.
+// BSON 1.1 deprecates five element types — undefined, DBPointer,
+// symbol, JavaScript with scope, and the binary subtypes `0x02` and
+// `0x03` — and this writer answers `BsonDeprecatedOnWrite` naming the
+// key it found one under.
+//
+// The alternative was to write them anyway, and the alternative is
+// worse in both directions.  A writer that emitted them would let a
+// program produce new documents in a form the specification says has no
+// future, and a writer that silently REPLACED them — a symbol written
+// as a string, an undefined written as a null — would change a
+// document's meaning under a caller who asked for a round trip.  The
+// refusal names the key, so the caller decides: drop the element,
+// convert it deliberately with `bsonvalue.replace`, or keep the
+// original bytes.
+//
+// So bytes do NOT always round-trip, and the direction matters: every
+// document this writer produces reads back identical, and a document
+// READ from a legacy source may not be writable at all.
+// `bsonvalue.first_deprecated` answers that before the writer does.
+//
+// THE LENGTH PREFIXES ARE THE WHOLE DIFFICULTY.  A document's length
+// includes itself and its terminator, and a nested document's length is
+// part of its parent's.  `encoded_len` answers a document's size
+// without producing it, which is what a caller sizing a buffer or
+// checking the server's 16 MiB ceiling needs.
+
+// How many bytes the document will occupy, terminator included.
+//
+// Computed, not measured: nothing is written.  The number a caller
+// checks against the server's document ceiling before it builds a
+// sixteen-megabyte buffer.
+//
+// The same refusals `write` makes, for the same reasons — a document
+// this writer will not emit has no length here either.
+//
+// ```novo
+// use bsonvalue
+// use bsonwrite
+//
+// fn main() [io]
+//     match bsonwrite.encoded_len(bsonvalue.doc())
+//         Ok(n)  => println("${n}")   // 5
+//         Err(e) => println(e.message())
+// ```
+pub fn encoded_len(d: BsonDoc) -> Result<Int, BsonError> []
+    todo("bson-nv.bsonwrite.encoded_len")
+
+// The document's bytes.
+//
+// `BsonDeprecatedOnWrite` naming the key when the document, or anything
+// nested in it, holds an element type BSON 1.1 deprecates.
+// `BsonEmbeddedNul` when a key or a regex pattern contains a `0x00`,
+// which the wire's C strings cannot carry.
+//
+// ```novo
+// use std.bytes
+// use bsonvalue
+// use bsonwrite
+//
+// fn main() [io]
+//     match bsonwrite.write(bsonvalue.doc())
+//         Ok(b)  => println(bytes.to_hex(b))   // 0500000000
+//         Err(e) => println(e.message())
+// ```
+pub fn write(d: BsonDoc) -> Result<Bytes, BsonError> []
+    todo("bson-nv.bsonwrite.write")
+
+// The bytes of one element, type code and key included, as they would
+// appear inside a document.
+//
+// What a caller assembling a document out of pieces it already has —
+// an update built from stored fragments — uses to avoid rebuilding the
+// tree.
+pub fn write_elem(e: BsonElem) -> Result<Bytes, BsonError> []
+    todo("bson-nv.bsonwrite.write_elem")
+
+// Every document in a list, concatenated, which is the form a mongodump
+// archive and an oplog file take.
+//
+// `bsonread.read_all` is the inverse.
+pub fn write_all(docs: [BsonDoc]) -> Result<Bytes, BsonError> []
+    todo("bson-nv.bsonwrite.write_all")
+
+// Whether this writer will emit the document, without producing any
+// bytes.
+//
+// `Ok(true)` or the first refusal, in the order the writer would meet
+// it.  A caller filtering a stream of documents by writability calls
+// this and never allocates a buffer for the ones it drops.
+//
+// ```novo
+// use bsonvalue
+// use bsonwrite
+//
+// fn main() [io]
+//     match bsonwrite.can_write(bsonvalue.doc())
+//         Ok(_)  => println("writable")
+//         Err(e) => println(e.message())
+// ```
+pub fn can_write(d: BsonDoc) -> Result<Bool, BsonError> []
+    todo("bson-nv.bsonwrite.can_write")
+
+// `d` with every deprecated element replaced by the current element
+// that carries the same information, and the ones that carry none
+// removed.
+//
+// THE DELIBERATE CONVERSION the writer refuses to perform silently.  A
+// symbol becomes a string, JavaScript with scope becomes a document
+// with `$code` and `$scope` members, a DBPointer becomes a document
+// with `$ref` and `$id`, and an undefined is REMOVED — those are the
+// substitutions MongoDB's own drivers make, and the last one is why
+// this cannot be the default: removing an element changes a document's
+// shape, and a caller has to ask for that.
+//
+// ```novo
+// use bsonvalue
+// use bsonwrite
+//
+// fn main() [io]
+//     let d = bsonwrite.modernised(bsonvalue.doc())
+//     println("${bsonvalue.len(d)}")   // 0
+// ```
+pub fn modernised(d: BsonDoc) -> BsonDoc []
+    todo("bson-nv.bsonwrite.modernised")

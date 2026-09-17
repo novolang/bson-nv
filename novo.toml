@@ -1,0 +1,54 @@
+[package]
+name        = "bson-nv"
+version     = "0.0.1"
+description = "BSON 1.1: every element type read — decimal128, the binary subtypes, and the five the specification deprecates — and only the current ones written, so a legacy document is refused at the writer rather than quietly modernised.  A document is a value that keeps its insertion order and its duplicate keys, and Extended JSON v2 converts both ways against std.json in the canonical and the relaxed form.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: arithmetic over bytes the caller already holds.  Every public
+# function declares `[]`, and the two places an effect could have crept
+# in are named rather than left to be discovered.  A UTC datetime is an
+# element's own millisecond count and is never compared against a clock
+# this package reads, and an ObjectId's four-byte timestamp and counter
+# arrive as parameters — `object_id_from_parts` takes them — because
+# generating one needs a clock and a random seed and this package has
+# neither.
+#
+# NO `tests/embedded_probe.nv`, and the absence is a claim not made
+# rather than a claim skipped.  A document is a list of elements, one
+# allocation per element, and Extended JSON speaks `std.json`, which
+# refuses the embedded tier outright.
+layer       = "core"
+
+category    = "data"
+
+tags        = ["bson", "mongodb", "extended-json", "decimal128", "objectid", "wire-format", "sans-io"]
+repository  = "https://github.com/novolang/bson-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The binary document format MongoDB stores and speaks"
+
+[dependencies]
+# None, and the two absences are the ones a reader will look for.
+#
+# NOT a JSON package.  Extended JSON is converted against
+# `std.json`'s own value type, which is in the standard library and in
+# every consumer's assembly already.  A package of this one's own would
+# put a second JSON model beside it.
+#
+# NOT decimal-nv.  A decimal128 element is carried as the exact
+# sixteen bytes the wire held, so nothing is lost and no arithmetic is
+# offered; a caller that wants to ADD two of them converts to
+# decimal-nv's type itself.  The README says so under what is not
+# included.

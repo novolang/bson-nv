@@ -1,0 +1,563 @@
+// bson_tests.nv — the API suite, written against the signatures.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: bson-nv.<module>.<fn>`.
+// That is the expected state of an interface release: the compiler has
+// checked every signature, every type and every effect row, and nothing
+// else has been checked because there is nothing else yet.
+//
+// THE VECTORS ARE THE BSON CORPUS'S.  The MongoDB specifications
+// repository publishes `bson-corpus`, a set of JSON files each holding
+// a list of `canonical_bson` / `canonical_extjson` / `relaxed_extjson`
+// triples, plus `decodeErrors` and `parseErrors` lists of documents
+// that must be REFUSED.  It is the oracle every driver is measured
+// against, and the cases below are taken from it and from the worked
+// examples on bsonspec.org.  The whole corpus becomes a generated run
+// beside this one when the implementation lands.
+
+use std.test
+use std.list
+use std.bytes
+use std.json
+use bsonerror
+use bsontype
+use bsonvalue
+use bsonread
+use bsonwrite
+use bsonjson
+
+// A document written the way a reader can check it against the corpus.
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+// ── The document grammar ────────────────────────────────────────────
+
+@test
+fn test_the_empty_document_is_five_bytes()
+    // A four-byte little-endian length that counts itself and the
+    // terminator, then the terminator.  The smallest document there is.
+    match bsonread.read(hex("0500000000"))
+        Err(e) => test.fail(e.message())
+        Ok(d)  => test.assert_eq(bsonvalue.len(d), 0)
+    match bsonwrite.write(bsonvalue.doc())
+        Err(e) => test.fail(e.message())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "0500000000")
+
+@test
+fn test_the_bsonspec_hello_world_document()
+    // bsonspec.org's first worked example: {"hello": "world"}.  The
+    // string's length prefix counts the trailing NUL, which is the
+    // off-by-one every first implementation makes.
+    let raw = hex("160000000268656c6c6f0006000000776f726c640000")
+    match bsonread.read(raw)
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            test.assert_eq(bsonvalue.len(d), 1)
+            match bsonvalue.get(d, "hello")
+                Err(e2) => test.fail(e2.message())
+                Ok(v)   =>
+                    test.assert_eq(bsonvalue.type_name(v), "string")
+                    match bsonvalue.as_str(v)
+                        Ok(s)   => test.assert_eq(s, "world")
+                        Err(e3) => test.fail(e3.message())
+
+@test
+fn test_a_document_writes_back_to_the_bytes_it_was_read_from()
+    let raw = hex("160000000268656c6c6f0006000000776f726c640000")
+    match bsonread.read(raw)
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            match bsonwrite.write(d)
+                Err(e2) => test.fail(e2.message())
+                Ok(b)   => test.assert_eq(bytes.to_hex(b), bytes.to_hex(raw))
+
+@test
+fn test_an_int32_element_keeps_its_width()
+    // 0x10 is int32 and 0x12 is int64, and a driver that widened every
+    // integer would change the bytes of every document it touched.
+    let raw = hex("0c0000001061000100000000")
+    match bsonread.read(raw)
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            match bsonvalue.get(d, "a")
+                Err(e2) => test.fail(e2.message())
+                Ok(v)   =>
+                    test.assert_eq(bsonvalue.type_name(v), "int")
+                    test.assert_eq(bsonvalue.type_code(v), 16)
+                    match bsonvalue.as_int(v)
+                        Ok(n)   => test.assert_eq(n, 1)
+                        Err(e3) => test.fail(e3.message())
+
+@test
+fn test_the_length_prefix_is_normative()
+    // A corpus `decodeErrors` case: the declared length is not the
+    // number of bytes the document occupies.  A tolerant reader here is
+    // a reader that walks off the end of an attacker's buffer.
+    match bsonread.read(hex("0600000000"))
+        Ok(_)  => test.fail("a length prefix that lies is a refusal")
+        Err(e) => test.assert(bsonerror.is_document_fault(e))
+
+@test
+fn test_a_document_must_end_with_its_terminator()
+    match bsonread.read(hex("050000000c"))
+        Ok(_)  => test.fail("a missing terminator is a refusal")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "missing-terminator")
+
+@test
+fn test_a_second_document_in_the_buffer_is_not_ignored()
+    // `read` means one document.  Two of them is `BsonTrailingBytes`,
+    // and a caller that meant otherwise uses `read_prefix`.
+    let two = hex("05000000000500000000")
+    match bsonread.read(two)
+        Ok(_)  => test.fail("trailing bytes are a refusal")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "trailing-bytes")
+    match bsonread.read_prefix(two)
+        Err(e) => test.fail(e.message())
+        Ok(p)  =>
+            test.assert_eq(p.consumed, 5)
+            test.assert_eq(bsonvalue.len(p.value), 0)
+    match bsonread.read_all(two)
+        Err(e) => test.fail(e.message())
+        Ok(ds) => test.assert_eq(list.len(ds), 2)
+
+@test
+fn test_the_length_is_readable_before_the_document_is()
+    // What a stream reader calls first: take four bytes, learn how many
+    // more to wait for.
+    match bsonread.document_length(hex("16000000"))
+        Err(e) => test.fail(e.message())
+        Ok(n)  => test.assert_eq(n, 22)
+    match bsonread.document_length(hex("1600"))
+        Ok(_)  => test.fail("two bytes are not a length")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "truncated")
+    match bsonread.document_length(hex("1600000000"))
+        Err(e) => test.fail(e.message())
+        Ok(n)  => test.assert_eq(n, 22)
+
+@test
+fn test_a_validator_walks_without_building()
+    match bsonread.validate(hex("0500000000"))
+        Err(e) => test.fail(e.message())
+        Ok(ok) => test.assert(ok)
+
+@test
+fn test_the_reader_has_a_depth_limit_and_it_is_a_value()
+    let l = bsonread.default_limits()
+    test.assert_eq(l.max_depth, 64)
+    test.assert_eq(l.max_document_bytes, 16777216)
+    test.assert(l.refuse_reserved_keys == false)
+    match bsonread.read_with(hex("0500000000"), l)
+        Err(e) => test.fail(e.message())
+        Ok(d)  => test.assert_eq(bsonvalue.len(d), 0)
+    match bsonread.read_prefix_with(hex("0500000000"), l)
+        Err(e) => test.fail(e.message())
+        Ok(p)  => test.assert_eq(p.consumed, 5)
+
+@test
+fn test_one_value_can_be_found_without_building_the_document()
+    // The scan a caller pulling an `_id` out of a megabyte of stored
+    // document wants, and the only way to get the exact original bytes
+    // of a sub-document back.
+    let raw = hex("160000000268656c6c6f0006000000776f726c640000")
+    match bsonread.value_span(raw, "hello")
+        Err(e)      => test.fail(e.message())
+        Ok(None)    => test.fail("the key is there")
+        Ok(Some(s)) =>
+            test.assert_eq(s.type_code, 2)
+            test.assert(s.to > s.from)
+
+// ── A document is ordered, and may repeat a key ─────────────────────
+
+@test
+fn test_the_order_is_the_documents_and_append_does_not_sort()
+    let d = bsonvalue.append(
+                bsonvalue.append(bsonvalue.doc(), "b", BsonInt32(2)),
+                "a", BsonInt32(1))
+    test.assert_eq(list.len(bsonvalue.keys(d)), 2)
+    match bsonvalue.at(d, 0)
+        None    => test.fail("there are two elements")
+        Some(e) => test.assert_eq(e.key, "b")
+
+@test
+fn test_a_duplicate_key_is_visible_and_get_answers_the_first()
+    // The server rejects such a document; a file on disk may still hold
+    // one, and a reader that could not SEE both could not say so.
+    let d = bsonvalue.append(
+                bsonvalue.append(bsonvalue.doc(), "a", BsonInt32(1)),
+                "a", BsonInt32(2))
+    test.assert_eq(bsonvalue.count_of(d, "a"), 2)
+    test.assert(bsonvalue.has(d, "a"))
+    match bsonvalue.get(d, "a")
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match bsonvalue.as_int(v)
+                Ok(n)   => test.assert_eq(n, 1)
+                Err(e2) => test.fail(e2.message())
+
+@test
+fn test_replace_keeps_the_position_and_remove_takes_every_one()
+    let d = bsonvalue.doc_of([bsonvalue.elem("a", BsonInt32(1)),
+                              bsonvalue.elem("b", BsonInt32(2)),
+                              bsonvalue.elem("a", BsonInt32(3))])
+    let r = bsonvalue.replace(d, "a", BsonInt32(9))
+    match bsonvalue.at(r, 0)
+        None    => test.fail("the element is still first")
+        Some(e) => test.assert_eq(e.key, "a")
+    test.assert_eq(bsonvalue.count_of(bsonvalue.remove(d, "a"), "a"), 0)
+
+@test
+fn test_a_missing_key_is_a_named_refusal_and_an_option_both()
+    match bsonvalue.get(bsonvalue.doc(), "_id")
+        Ok(_)  => test.fail("the document is empty")
+        Err(e) =>
+            test.assert_eq(bsonerror.code_of(e), "no-such-key")
+            test.assert(bsonerror.is_document_fault(e) == false)
+    match bsonvalue.lookup(bsonvalue.doc(), "_id")
+        Some(_) => test.fail("the document is empty")
+        None    => test.assert(true)
+
+@test
+fn test_a_path_descends_documents_and_not_arrays()
+    let inner = bsonvalue.append(bsonvalue.doc(), "b", BsonInt32(7))
+    let d = bsonvalue.append(bsonvalue.doc(), "a", BsonDocument(inner))
+    match bsonvalue.path(d, ["a", "b"])
+        None    => test.fail("the path is there")
+        Some(v) =>
+            match bsonvalue.as_int(v)
+                Ok(n)   => test.assert_eq(n, 7)
+                Err(e2) => test.fail(e2.message())
+
+@test
+fn test_an_array_is_a_document_with_decimal_string_keys()
+    // The format's one real surprise, and the reason an array costs
+    // more bytes than a JSON array.
+    let a = bsonvalue.array_doc([BsonInt32(1), BsonInt32(2)])
+    test.assert_eq(bsonvalue.len(a), 2)
+    match bsonvalue.at(a, 1)
+        None    => test.fail("there are two elements")
+        Some(e) => test.assert_eq(e.key, "1")
+    test.assert(bsonvalue.is_array_doc(a))
+    test.assert(bsonvalue.is_array_doc(
+        bsonvalue.append(bsonvalue.doc(), "x", BsonInt32(1))) == false)
+
+// ── Every type reads, the current ones write ────────────────────────
+
+@test
+fn test_the_deprecated_types_read()
+    // A document written by an old driver is still a document somebody
+    // has to open.  All five come back as their own arms.
+    test.assert_eq(bsonvalue.type_name(BsonUndefined), "undefined")
+    test.assert_eq(bsonvalue.type_code(BsonUndefined), 6)
+    test.assert_eq(bsonvalue.type_name(BsonSymbol("s")), "symbol")
+    test.assert_eq(bsonvalue.type_code(BsonSymbol("s")), 14)
+    test.assert_eq(bsonvalue.type_name(BsonCodeWithScope("f()", bsonvalue.doc())),
+                   "javascriptWithScope")
+    test.assert_eq(bsonvalue.type_code(BsonMinKey), 255)
+    test.assert_eq(bsonvalue.type_code(BsonMaxKey), 127)
+
+@test
+fn test_the_writer_refuses_a_deprecated_element_and_names_the_key()
+    let d = bsonvalue.append(bsonvalue.doc(), "s", BsonSymbol("legacy"))
+    test.assert(bsonvalue.is_deprecated(BsonSymbol("legacy")))
+    match bsonvalue.first_deprecated(d)
+        None    => test.fail("the symbol is deprecated")
+        Some(k) => test.assert_eq(k, "s")
+    match bsonwrite.can_write(d)
+        Ok(_)  => test.fail("the writer refuses a symbol")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "deprecated-on-write")
+    match bsonwrite.write(d)
+        Ok(_)  => test.fail("the writer refuses a symbol")
+        Err(e) => test.assert(bsonerror.is_document_fault(e) == false)
+    match bsonwrite.encoded_len(d)
+        Ok(_)  => test.fail("a document the writer refuses has no length")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "deprecated-on-write")
+
+@test
+fn test_modernising_is_a_deliberate_call_and_not_the_default()
+    // A symbol becomes a string and an undefined is REMOVED, which is
+    // why this cannot happen inside `write`.
+    let d = bsonvalue.doc_of([bsonvalue.elem("s", BsonSymbol("x")),
+                              bsonvalue.elem("u", BsonUndefined)])
+    let m = bsonwrite.modernised(d)
+    test.assert_eq(bsonvalue.len(m), 1)
+    match bsonwrite.can_write(m)
+        Err(e) => test.fail(e.message())
+        Ok(ok) => test.assert(ok)
+
+@test
+fn test_a_key_with_an_embedded_nul_is_refused_by_the_writer()
+    let d = bsonvalue.append(bsonvalue.doc(), "a\u{0}b", BsonInt32(1))
+    match bsonwrite.write(d)
+        Ok(_)  => test.fail("a C string cannot carry a NUL")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "embedded-nul")
+
+@test
+fn test_an_element_and_a_list_of_documents_write_on_their_own()
+    match bsonwrite.write_elem(bsonvalue.elem("a", BsonInt32(1)))
+        Err(e) => test.fail(e.message())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "10610001000000")
+    match bsonwrite.write_all([bsonvalue.doc(), bsonvalue.doc()])
+        Err(e) => test.fail(e.message())
+        Ok(b)  => test.assert_eq(bytes.to_hex(b), "05000000000500000000")
+
+@test
+fn test_the_accessors_answer_their_own_type_and_refuse_the_others()
+    match bsonvalue.as_float(BsonDouble(1.5))
+        Ok(f)  => test.assert_eq(f, 1.5)
+        Err(e) => test.fail(e.message())
+    match bsonvalue.as_bool(BsonBool(true))
+        Ok(b)  => test.assert(b)
+        Err(e) => test.fail(e.message())
+    match bsonvalue.as_datetime_millis(BsonDateTime(0 - 1000))
+        Ok(n)  => test.assert_eq(n, 0 - 1000)
+        Err(e) => test.fail(e.message())
+    match bsonvalue.as_doc(BsonDocument(bsonvalue.doc()))
+        Ok(d)  => test.assert_eq(bsonvalue.len(d), 0)
+        Err(e) => test.fail(e.message())
+    match bsonvalue.as_array(BsonArray([BsonNull]))
+        Ok(xs) => test.assert_eq(list.len(xs), 1)
+        Err(e) => test.fail(e.message())
+    // A symbol is text on the wire and is NOT a string here: a program
+    // that read it as one would write it back as one.
+    match bsonvalue.as_str(BsonSymbol("x"))
+        Ok(_)  => test.fail("a symbol is not a string")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "wrong-type")
+    match bsonvalue.type_of_code(16)
+        Ok(n)  => test.assert_eq(n, "int")
+        Err(e) => test.fail(e.message())
+    match bsonvalue.type_of_code(200)
+        Ok(_)  => test.fail("200 is not a type code")
+        Err(e) => test.assert_eq(bsonerror.offset_of(e), 0)
+
+// ── The scalar types with rules of their own ────────────────────────
+
+@test
+fn test_an_object_id_is_twelve_bytes_and_carries_its_timestamp()
+    match bsontype.object_id_from_hex("507f1f77bcf86cd799439011")
+        Err(e) => test.fail(e.message())
+        Ok(o)  =>
+            test.assert_eq(bsontype.object_id_hex(o), "507f1f77bcf86cd799439011")
+            test.assert_eq(bsontype.object_id_timestamp(o), 1350953847)
+            test.assert_eq(bytes.len(bsontype.object_id_bytes(o)), 12)
+            test.assert_eq(bytes.len(bsontype.object_id_random(o)), 5)
+            test.assert_eq(bsontype.object_id_counter(o), 4207121)
+            match bsonvalue.as_object_id(BsonObjectIdValue(o))
+                Ok(_)   => test.assert(true)
+                Err(e2) => test.fail(e2.message())
+    match bsontype.object_id(bytes.zeros(11))
+        Ok(_)  => test.fail("eleven bytes are not an ObjectId")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "bad-object-id")
+
+@test
+fn test_a_fresh_object_id_is_assembled_from_parts_the_caller_read()
+    // The constructor that keeps this package `core`: the clock and the
+    // random bytes are spent in the caller, where they are visible.
+    match bsontype.object_id_from_parts(1350953847, bytes.zeros(5), 1)
+        Err(e) => test.fail(e.message())
+        Ok(o)  =>
+            test.assert_eq(bsontype.object_id_timestamp(o), 1350953847)
+            test.assert_eq(bsontype.object_id_counter(o), 1)
+
+@test
+fn test_the_binary_subtype_table_is_exact()
+    test.assert_eq(bsontype.subtype_code(BsonGeneric), 0)
+    test.assert_eq(bsontype.subtype_code(BsonFunction), 1)
+    test.assert_eq(bsontype.subtype_code(BsonBinaryOld), 2)
+    test.assert_eq(bsontype.subtype_code(BsonUuidOld), 3)
+    test.assert_eq(bsontype.subtype_code(BsonUuid), 4)
+    test.assert_eq(bsontype.subtype_code(BsonMd5), 5)
+    test.assert_eq(bsontype.subtype_code(BsonEncrypted), 6)
+    test.assert_eq(bsontype.subtype_code(BsonCompressedColumn), 7)
+    test.assert_eq(bsontype.subtype_code(BsonSensitive), 8)
+    test.assert_eq(bsontype.subtype_code(BsonUserDefined(128)), 128)
+    test.assert_eq(bsontype.subtype_name(BsonUuidOld), "uuid-old")
+    test.assert(bsontype.is_deprecated_subtype(BsonUuidOld))
+    test.assert(bsontype.is_deprecated_subtype(BsonBinaryOld))
+    test.assert(bsontype.is_deprecated_subtype(BsonUuid) == false)
+
+@test
+fn test_the_reserved_subtype_range_is_refused()
+    // `0x09` to `0x7F` is neither assigned nor open to users, and a
+    // reader that accepted it would accept what a later version of the
+    // format will define.
+    match bsontype.subtype_of_code(0)
+        Err(e) => test.fail(e.message())
+        Ok(s)  => test.assert_eq(bsontype.subtype_code(s), 0)
+    match bsontype.subtype_of_code(16)
+        Ok(_)  => test.fail("0x10 is reserved")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "reserved-subtype")
+
+@test
+fn test_a_binary_payload_is_checked_against_its_subtypes_fixed_length()
+    let good = bsontype.binary(BsonUuid, bytes.zeros(16))
+    match bsontype.binary_check(good)
+        Err(e) => test.fail(e.message())
+        Ok(ok) => test.assert(ok)
+    match bsontype.binary_check(bsontype.binary(BsonMd5, bytes.zeros(4)))
+        Ok(_)  => test.fail("an MD5 digest is sixteen bytes")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "wrong-type")
+    match bsonvalue.as_binary(BsonBinaryValue(good))
+        Ok(b)  => test.assert_eq(bsontype.subtype_code(b.subtype), 4)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_regex_options_are_a_sorted_subset_of_six_letters()
+    match bsontype.regex_check(bsontype.regex("^a", "imsx"))
+        Err(e) => test.fail(e.message())
+        Ok(ok) => test.assert(ok)
+    match bsontype.regex_check(bsontype.regex("^a", "mi"))
+        Ok(_)  => test.fail("`mi` is not in alphabetical order")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "bad-regex-options")
+    test.assert_eq(bsonvalue.type_name(BsonRegexValue(bsontype.regex("^a", ""))),
+                   "regex")
+
+@test
+fn test_a_replication_timestamp_orders_by_its_whole_64_bit_value()
+    let t = bsontype.timestamp(1350953847, 2)
+    test.assert_eq(t.increment, 2)
+    test.assert_eq(bsontype.timestamp_u64(t), 1350953847 * 4294967296 + 2)
+    test.assert_eq(bsonvalue.type_code(BsonTimestampValue(t)), 17)
+
+@test
+fn test_a_decimal128_is_carried_as_its_sixteen_bytes()
+    // No arithmetic is offered, so nothing can be lost: the bytes that
+    // came in are the bytes that go out.
+    match bsontype.decimal128_from_bytes(bytes.zeros(16))
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            test.assert_eq(bytes.len(bsontype.decimal128_bytes(d)), 16)
+            test.assert(bsontype.decimal128_is_nan(d) == false)
+            test.assert(bsontype.decimal128_is_negative(d) == false)
+            match bsonvalue.as_decimal128(BsonDecimal128Value(d))
+                Ok(_)   => test.assert(true)
+                Err(e2) => test.fail(e2.message())
+    match bsontype.decimal128_from_bytes(bytes.zeros(8))
+        Ok(_)  => test.fail("a decimal128 is sixteen bytes")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "bad-decimal128")
+
+@test
+fn test_the_decimal128_special_values_are_read_out_of_the_combination_field()
+    // IEEE 754-2008: the combination field `11111` is NaN and `11110`
+    // is infinity, which puts them in the high half.
+    let nan = bsontype.decimal128(8935141660703064064, 0)
+    test.assert(bsontype.decimal128_is_nan(nan))
+    test.assert_eq(bsontype.decimal128_to_str(nan), "NaN")
+    let inf = bsontype.decimal128(8646911284551352320, 0)
+    test.assert(bsontype.decimal128_is_infinite(inf))
+    test.assert_eq(bsontype.decimal128_to_str(inf), "Infinity")
+    match bsontype.decimal128_from_str("0.001")
+        Err(e) => test.fail(e.message())
+        Ok(d)  => test.assert_eq(bsontype.decimal128_to_str(d), "0.001")
+    match bsontype.decimal128_from_str("not a number")
+        Ok(_)  => test.fail("that is not a decimal")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "bad-decimal128")
+
+@test
+fn test_a_db_pointer_can_be_built_and_cannot_be_written()
+    match bsontype.object_id_from_hex("507f1f77bcf86cd799439011")
+        Err(e) => test.fail(e.message())
+        Ok(o)  =>
+            let p = bsontype.db_pointer("db.coll", o)
+            test.assert_eq(p.namespace, "db.coll")
+            test.assert(bsonvalue.is_deprecated(BsonDbPointerValue(p)))
+
+// ── Extended JSON v2 ────────────────────────────────────────────────
+
+@test
+fn test_the_two_forms_are_named_and_the_mode_is_an_argument()
+    test.assert_eq(bsonjson.mode_name(BsonCanonicalExt), "canonical")
+    test.assert_eq(bsonjson.mode_name(BsonRelaxedExt), "relaxed")
+
+@test
+fn test_canonical_wraps_every_number_and_relaxed_writes_it_plainly()
+    // The corpus's `canonical_extjson` and `relaxed_extjson` columns,
+    // and the reason there are two of them.
+    let d = bsonvalue.append(bsonvalue.doc(), "n", BsonInt64(12))
+    test.assert_eq(bsonjson.doc_to_text(d, BsonCanonicalExt),
+                   "{\"n\":{\"\$numberLong\":\"12\"}}")
+    test.assert_eq(bsonjson.doc_to_text(d, BsonRelaxedExt), "{\"n\":12}")
+
+@test
+fn test_a_decimal_is_wrapped_in_both_forms_because_json_cannot_write_one()
+    match bsontype.decimal128_from_str("0.1")
+        Err(e) => test.fail(e.message())
+        Ok(x)  =>
+            let d = bsonvalue.append(bsonvalue.doc(), "d", BsonDecimal128Value(x))
+            test.assert_eq(bsonjson.doc_to_text(d, BsonRelaxedExt),
+                           "{\"d\":{\"\$numberDecimal\":\"0.1\"}}")
+
+@test
+fn test_reading_accepts_either_form_because_the_mode_is_a_writing_choice()
+    match bsonjson.doc_from_text("{\"n\":{\"\$numberLong\":\"12\"}}")
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            match bsonvalue.get(d, "n")
+                Err(e2) => test.fail(e2.message())
+                Ok(v)   => test.assert_eq(bsonvalue.type_name(v), "long")
+    match bsonjson.doc_from_text("{\"n\":12}")
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            match bsonvalue.get(d, "n")
+                Err(e2) => test.fail(e2.message())
+                Ok(v)   => test.assert_eq(bsonvalue.type_name(v), "int")
+
+@test
+fn test_a_plain_json_number_takes_the_narrowest_type_that_holds_it()
+    // The specification's own rule, and the reason the relaxed form
+    // does not round-trip.
+    match bsonjson.doc_from_text("{\"a\":2147483648,\"b\":1.5}")
+        Err(e) => test.fail(e.message())
+        Ok(d)  =>
+            match bsonvalue.get(d, "a")
+                Err(e2) => test.fail(e2.message())
+                Ok(v)   => test.assert_eq(bsonvalue.type_name(v), "long")
+            match bsonvalue.get(d, "b")
+                Err(e2) => test.fail(e2.message())
+                Ok(v)   => test.assert_eq(bsonvalue.type_name(v), "double")
+
+@test
+fn test_a_wrapper_is_an_object_with_only_reserved_members()
+    // `{"$oid": "…"}` is an ObjectId; `{"$oid": "…", "x": 1}` is a
+    // document with a key that begins with a dollar sign.  That
+    // distinction is the whole of Extended JSON's ambiguity.
+    match json.parse("{\"\$oid\":\"507f1f77bcf86cd799439011\"}")
+        None    => test.fail("that is JSON")
+        Some(j) =>
+            test.assert(bsonjson.is_type_wrapper(j))
+            match bsonjson.value_from_json(j)
+                Err(e) => test.fail(e.message())
+                Ok(v)  => test.assert_eq(bsonvalue.type_name(v), "objectId")
+    match json.parse("{\"\$oid\":\"507f1f77bcf86cd799439011\",\"x\":1}")
+        None    => test.fail("that is JSON")
+        Some(j) => test.assert(bsonjson.is_type_wrapper(j) == false)
+
+@test
+fn test_an_unknown_wrapper_is_refused_rather_than_read_as_a_document()
+    match bsonjson.doc_from_text("{\"a\":{\"\$notAType\":1}}")
+        Ok(_)  => test.fail("that wrapper has no type")
+        Err(e) => test.assert_eq(bsonerror.code_of(e), "unknown-extended-type")
+
+@test
+fn test_the_wrapper_names_are_the_specifications()
+    test.assert_eq(bsonjson.wrapper_name(BsonMinKey), "\$minKey")
+    test.assert_eq(bsonjson.wrapper_name(BsonInt64(1)), "\$numberLong")
+    test.assert_eq(bsonjson.wrapper_name(BsonInt32(1)), "\$numberInt")
+    // The five JSON writes directly have no wrapper.
+    test.assert_eq(bsonjson.wrapper_name(BsonNull), "")
+    test.assert_eq(bsonjson.wrapper_name(BsonString("s")), "")
+
+@test
+fn test_which_values_survive_the_relaxed_form()
+    test.assert(bsonjson.relaxed_round_trips(BsonString("s")))
+    test.assert(bsonjson.relaxed_round_trips(BsonInt64(1)) == false)
+    test.assert(bsonjson.relaxed_round_trips(BsonDateTime(0)) == false)
+
+@test
+fn test_a_value_and_a_document_convert_on_their_own()
+    let j = bsonjson.value_to_json(BsonString("s"), BsonCanonicalExt)
+    test.assert_eq(json.stringify(j), "\"s\"")
+    let dj = bsonjson.doc_to_json(bsonvalue.doc(), BsonCanonicalExt)
+    test.assert_eq(json.stringify(dj), "{}")
+    match bsonjson.doc_from_json(dj)
+        Err(e) => test.fail(e.message())
+        Ok(d)  => test.assert_eq(bsonvalue.len(d), 0)
